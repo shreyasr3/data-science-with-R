@@ -1,0 +1,649 @@
+---
+title: "Kaggle Project: House Prices"
+author: "Shreyas"
+date: "12/05/2021"
+knit: (function(inputFile, encoding) { 
+      out_dir <- 'docs';
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), out_dir, 'Kaggle_House_Prices.html')) })
+output: 
+  html_document:
+      toc: true
+---
+
+# Project Approach
+
+> The goal of this project is to predict house prices. The approach which we used begins with Exploratory Data Analysis (EDA). We then used Data visualization and plots with ggplot to study the data. We cleaned the data and preprocessed it to create a model. We used SalePrice as our main predictor and then tried to find correlated variables to see what variables would be useful in predicting house prices. We narrowed it down to the best variables and then we used a linear regression model to predict the home prices with the variables that add value to home prices. To verify our results, we cross-validated our predicted values, which allowed us to see if the results were consistent among the different models employed. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+## Libraries
+
+### Loading the required libraries
+
+>This code will install the missing libraries and then load them.
+
+```{r libraries}
+
+packages <- c("ggplot2","dplyr","plyr","tidyverse","data.table","knitr","kableExtra","caret","corrplot","randomForest","Hmisc","moments","psych","glmnet","scales","ggrepel","cowplot")
+
+for(pkg in packages){
+  if (pkg %in% rownames(installed.packages()) == FALSE)
+  {install.packages(pkg)}
+  if (pkg %in% rownames(.packages()) == FALSE)
+  {library(pkg, character.only = TRUE)}
+}
+```
+
+## Importing data
+
+>We are using `read.csv` to read data into train and test variables, setting character variables to be loaded as characters instead of factors.
+
+```{r imprting_data}
+
+train <- read.csv("ames_train.csv", stringsAsFactors = FALSE)
+test <- read.csv("ames_test.csv", stringsAsFactors = FALSE)
+
+dim(train)
+dim(test)
+    
+glimpse(train)
+
+```
+
+## Combining datasets
+
+>  Adding SalePrice column in the test dataset to make the variables equal in both train and test datasets. 
+
+```{r combining_data}
+
+test$SalePrice <- NA
+
+complete_data_set <- rbind(train, test) #Binding train & test data
+
+complete_data_set <- cbind(complete_data_set, Set = c(rep("Train", times = dim(train)[1]),
+                                rep("Test", times = dim(test)[1]))) 
+
+
+dim(complete_data_set)
+```
+
+>Checking the summary of all the variables like mean, median and sd
+
+```{r}
+describe(complete_data_set, fast=TRUE)
+```
+
+## Data Exploration and cleaning
+
+```{r}
+#To check the class (character, numeric, integer) of the variables in the data set
+
+table(sapply(complete_data_set, class)) 
+
+```
+> The dataset consists of 43 characters and 37 integer variables, and 35 columns with missing values (NA values). 
+
+
+## Response variable - SalePrice
+
+```{r SalePrice}
+
+# Building a dataset with response variable SalePrice and its log transformation
+
+data <- complete_data_set %>%
+          select("SalePrice") %>%
+          na.omit %>%
+          mutate(LogSalePrice = log(SalePrice+1))
+
+summary(data$SalePrice)
+
+cat("Skewness: ",skewness(data$SalePrice),"\n")
+cat("Kurtosis: ",kurtosis(data$SalePrice))
+
+```
+> A positive skew indicates that the tail is on the right side of the distribution, which extends towards more positive values and a kurtosis greater than 3, it is said to be `leptokurtic`, which means it tends to produce more outliers than the normal distribution. To correct this we have used the log transformation of the response variable.
+
+## Histogram plots of SalePrice
+
+```{r histogram_plot}
+
+#Histogram plots of SalePrice and its log transformation
+
+hist1 <- ggplot(data, aes(x = SalePrice, fill = ..count..), add=TRUE) +
+  geom_histogram(binwidth = 5000) +
+  ggtitle("Plot 1: Histogram plot of SalePrice") +
+  ylab("Frequency (Number of houses)") +
+  xlab("SalePrice") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+hist2 <- ggplot(data, aes(x = LogSalePrice, fill = ..count..)) +
+  geom_histogram(binwidth = 0.05) +
+  ggtitle("Plot 2: Histogram plot of log(SalePrice)") +
+  ylab("Frequency (Number of houses)") +
+  xlab("log(SalePrice)") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+cowplot::plot_grid(hist1, hist2)
+
+```
+
+> Histogram plot to the left is positively skewed. Plot to the right represents the log transformation of the same response variable which follows normal distribution.
+
+## Predictor Variables
+
+### Checking the count of NA values
+
+```{r na_values }
+
+variables_with_na <- which(colSums(is.na(complete_data_set)) > 0)
+
+sort(colSums(sapply(complete_data_set[variables_with_na], is.na)), decreasing = TRUE)
+
+```
+> We studied the NA values of all the variables above and found some discrepancies and some missing values that we corrected.
+
+## Interpreting the NA values
+
+```{r}
+
+#Special Case: Basement specific variables, there is a mismatch in NA values in the below variables.
+
+complete_data_set[ !is.na(complete_data_set$BsmtFinType1) & (   
+                    is.na(complete_data_set$BsmtCond) | 
+                      is.na(complete_data_set$BsmtQual) | 
+                      is.na(complete_data_set$BsmtExposure) | 
+                      is.na(complete_data_set$BsmtFinType2)), 
+                   c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')
+                  ]
+
+#Special Case: Garage specific variables, there is a mismatch in NA values, will check the entries
+
+complete_data_set[ !is.na(complete_data_set$GarageType) & is.na(complete_data_set$GarageFinish), 
+                   c('GarageCars', 'GarageArea', 'GarageType', 'GarageCond', 'GarageQual', 'GarageFinish')
+                 ]
+
+
+```
+
+## Function to replace NA values
+
+
+```{r replace_na }
+
+clean_na_func <- function(data_set_name) {
+
+  #Basement special cases, missing values
+  data_set_name$BsmtFinType2[333] <- names(which.max(table(data_set_name$BsmtFinType2)))
+  data_set_name$BsmtExposure[c(949, 1488, 2349)] <- names(which.max(table(data_set_name$BsmtExposure)))
+  data_set_name$BsmtCond[c(2041, 2186, 2525)] <- names(which.max(table(data_set_name$BsmtCond)))
+  data_set_name$BsmtQual[c(2218, 2219)] <- names(which.max(table(data_set_name$BsmtQual)))
+  
+  #Garage special case, missing value
+  data_set_name$GarageFinish[2127] <- names(which.max(table(data_set_name$GarageFinish)))
+  data_set_name$GarageCond[2127] <- names(which.max(table(data_set_name$GarageCond)))
+  data_set_name$GarageQual[2127] <- names(which.max(table(data_set_name$GarageQual)))
+
+  data_set_name$GarageCars[2577] <- 0
+  data_set_name$GarageArea[2577] <- 0
+  data_set_name$GarageType[2577] <- "None"
+  
+  #correcting the error
+  data_set_name$GarageYrBlt[2593] <- 2007 #GarageYrBlt=2207 looks like a typo, YearBuilt=2006, YearRemodAdd=2007.
+  
+
+  # For below variables where an absence of a feature is NA value, replacing it with 'None'
+
+  ColVector <- c("Alley", "BsmtQual", "BsmtExposure", "BsmtFinType1", "BsmtFinType2", "FireplaceQu", "PoolQC", "Fence",
+                 "MiscFeature", "GarageType", "GarageFinish", "GarageQual", "GarageCond", "BsmtCond")
+  
+  data_set_name[,ColVector] <- apply(data_set_name[,ColVector], 2, 
+                    function(x) {
+                            replace(x, is.na(x), "None")
+                            }
+                    )
+
+  
+# Missing value is replaced by 0 in below Numeric Variables
+  
+  ColVector <- c( "MasVnrArea", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF", "BsmtFullBath", "BsmtHalfBath")
+  
+  data_set_name[,ColVector] <- apply(data_set_name[,ColVector], 2, 
+                    function(x) {
+                            replace(x, is.na(x), 0)
+                            }
+                    )
+
+# Replacing with the maximum value (mode values) in below variables
+
+  ColVector <- c("MSZoning", "Utilities", "Exterior1st", "Exterior2nd", "MasVnrType", "Electrical", "KitchenQual", 
+                 "Functional", "SaleType")
+  
+  data_set_name[,ColVector] <- apply(data_set_name[,ColVector], 2, 
+                    function(x) {
+                            replace(x, is.na(x), names(which.max(table(x))))
+                            }
+                    )
+
+# Replacing the value with the median
+
+  ColVector <- c("LotFrontage","GarageCars", "GarageArea", "BsmtFinSF1")
+
+  data_set_name[,ColVector] <- apply(data_set_name[,ColVector], 2, 
+                    function(x) {
+                            replace(x, is.na(x), median(x, na.rm = T))
+                            }
+                    )
+
+# Assuming that the Garage was built the same year when the house was built to replace the NA values
+
+  data_set_name$GarageYrBlt[is.na(complete_data_set$GarageYrBlt)] <- data_set_name$YearBuilt[is.na(complete_data_set$GarageYrBlt)]
+  
+return(data_set_name) 
+}
+
+complete_data_set <- clean_na_func(complete_data_set)
+```
+
+## MSZoning Variable
+
+### Boxplot of SalePrice by MSZoning
+
+```{r}
+
+ggplot(data=complete_data_set[!is.na(complete_data_set$SalePrice),], aes(x=factor(MSZoning), y=SalePrice)) +
+ geom_boxplot(outlier.colour = "red", outlier.shape = 1)  +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)  + 
+ggtitle("Plot 3: Box plot of SalePrice by MSZoning")
+
+```
+
+### Relationship with GrLivArea
+
+```{r}
+complete_data_set %>%
+  select(MSZoning, GrLivArea) %>%
+  group_by(MSZoning) %>%
+  summarise_at(vars(GrLivArea), list(count = length,avg_houseSize = mean))
+
+```
+> Average size of a house in commercial is much smaller than that in village zone, so there is no data discrepancy in this predictor variable and can be used in the model.
+
+## Converting Quality variables to integer variables
+
+```{r}
+
+convert_to_int_func <- function(data_set_name) {
+  
+  
+  #There are various columns which has below scores, we would convert then to integer values based on the quality.
+  
+  score <- c('None'=0, 'Po'=1, 'Fa'=2, 'TA'=3, 'Gd'=4, 'Ex'=5)
+
+  data_set_name$PoolQC <- as.integer(revalue(data_set_name$PoolQC, score))
+  data_set_name$FireplaceQu <- as.integer(revalue(data_set_name$FireplaceQu, score))
+  data_set_name$KitchenQual <- as.integer(revalue(data_set_name$KitchenQual, score))
+  data_set_name$ExterQual <- as.integer(revalue(data_set_name$ExterQual, score))
+  data_set_name$ExterCond <- as.integer(revalue(data_set_name$ExterCond, score))
+  data_set_name$BsmtQual <- as.integer(revalue(data_set_name$BsmtQual, score))
+  data_set_name$BsmtCond <- as.integer(revalue(data_set_name$BsmtCond, score))
+  data_set_name$GarageQual <- as.integer(revalue(data_set_name$GarageQual, score))
+  data_set_name$GarageCond <- as.integer(revalue(data_set_name$GarageCond, score))
+
+
+  data_set_name$BsmtExposure <- as.integer(revalue(data_set_name$BsmtExposure, 
+                                                 c('None'=0, 'No'=1, 'Mn'=2, 'Av'=3, 'Gd'=4)))
+
+  data_set_name$BsmtFinType1 <- as.integer(revalue(data_set_name$BsmtFinType1, 
+                                                 c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)))
+  
+  data_set_name$BsmtFinType2 <- as.integer(revalue(data_set_name$BsmtFinType2, 
+                                                 c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)))
+
+  data_set_name$LotShape <- as.integer(revalue(data_set_name$LotShape, 
+                                             c('IR3'=0, 'IR2'=1, 'IR1'=2, 'Reg'=3)))
+
+  data_set_name$GarageFinish<- as.integer(revalue(data_set_name$GarageFinish, 
+                                                 c('None'=0, 'Unf'=1, 'RFn'=2, 'Fin'=3)))
+  
+  data_set_name$MasVnrType <- as.integer(revalue(data_set_name$MasVnrType, 
+                                               c('None'=0, 'BrkCmn'=0, 'BrkFace'=1, 'Stone'=2)))
+  
+  data_set_name$Functional <- as.integer(revalue(data_set_name$Functional, 
+                                                 c('Sal'=0, 'Sev'=1, 'Maj2'=2, 'Maj1'=3, 'Mod'=4, 'Min2'=5, 'Min1'=6, 'Typ'=7)))
+  
+
+return(data_set_name)
+}
+
+complete_data_set <- convert_to_int_func(complete_data_set)
+
+table(sapply(complete_data_set, class))
+```
+
+## Feature Engineering 
+
+```{r combining_variables, echo = FALSE}
+
+combining_variables_func <- function(data_set_name) {
+  
+  #Creating a "total number of bathrooms" variable by adding all bathroom features
+  data_set_name$TotalBaths <- data_set_name$BsmtFullBath + 
+                                (0.5 * data_set_name$BsmtHalfBath) +
+                                data_set_name$FullBath + 
+                                (0.5 * data_set_name$HalfBath)
+  
+  #Creating the age variables 
+  data_set_name$RemodelAge <- data_set_name$YrSold - data_set_name$YearRemodAdd
+  
+  data_set_name$RemodelFlag <- ifelse(data_set_name$RemodelAge == 0, 0,1) #0-No, 1-Yes
+  
+ data_set_name$TotalAreaSF <- data_set_name$TotalBsmtSF + data_set_name$GrLivArea
+ 
+  #Creating a "total area" variable by adding the basement area and ground living area
+ data_set_name$TotalSF <- data_set_name$TotalBsmtSF + 
+                            data_set_name$X1stFlrSF + 
+                            data_set_name$X2ndFlrSF +
+                            data_set_name$LowQualFinSF 
+
+
+# Creating a "total porch area" variable by adding all porch features
+ data_set_name$TotalPorchSF <- data_set_name$OpenPorchSF + 
+                                data_set_name$EnclosedPorch + 
+                                data_set_name$X3SsnPorch + 
+                                data_set_name$ScreenPorch +
+                                data_set_name$WoodDeckSF
+
+ # Creating Scores based variables on Quality and Condition features of the dataset
+
+  data_set_name$OverallScore <- data_set_name$OverallQual * data_set_name$OverallCond
+  data_set_name$GarageScore <- data_set_name$GarageQual * data_set_name$GarageCond
+  data_set_name$ExterScore <- data_set_name$ExterQual * data_set_name$ExterCond
+  data_set_name$KitchenScore <- data_set_name$KitchenAbvGr * data_set_name$KitchenQual
+  data_set_name$FireplaceScore <- data_set_name$Fireplaces * data_set_name$FireplaceQu
+  data_set_name$GarageAreaScore <- data_set_name$GarageArea * data_set_name$GarageQual
+  data_set_name$PoolScore <- data_set_name$PoolArea * data_set_name$PoolQC
+
+return(data_set_name)
+}
+
+complete_data_set <- combining_variables_func(complete_data_set)
+
+```
+
+## Correlation Plot
+
+```{r plot, fig.height = 12, fig.width = 14}
+
+numeric_train_data <- complete_data_set %>% filter(Set == "Train") %>% 
+                                select(which(sapply(.,is.integer)), which(sapply(., is.numeric)))
+#, use = "pairwise.complete.obs"
+correlation <- cor( numeric_train_data ) %>%
+                as.matrix( sort( correlation[,'SalePrice'], decreasing = TRUE )) #sort on decreasing correlations with SalePrice
+
+
+corrplot.mixed(correlation, tl.col="black", tl.pos = "lt")
+```
+> From the correlation plot, we found a list of variables that are highly correlated with each other so we can remove one of them.
+
+
+## Excluding some variables based on correlation plot
+
+```{r}
+column_drop_list <- c('Utilities','BsmtFullBath','BsmtHalfBath','FullBath','HalfBath','YearRemodAdd','YrSold',
+                      'EnclosedPorch','X3SsnPorch','ScreenPorch','WoodDeckSF','GarageArea','GarageQual','GarageCond',
+                      'ExterQual','ExterCond','KitchenQual','FireplaceQu','PoolArea','PoolQC'
+                      )
+
+complete_data_set <- complete_data_set[,!(names(complete_data_set) %in% column_drop_list)]
+```
+
+##Converting character variables to factors
+
+```{r}
+table(sapply(complete_data_set, class))
+
+# List of character variables
+variable_classes <- sapply(complete_data_set, class)
+names(variable_classes[which(variable_classes=="character")])
+
+```
+
+```{r}
+
+convert_to_factor_func <- function(data_set_name) {
+  
+#Numeric factors that should be categorical
+  data_set_name$MoSold <- factor(data_set_name$MoSold)
+  data_set_name$MSSubClass <- factor(data_set_name$MSSubClass)
+  
+  data_set_name <- data_set_name %>% 
+  mutate(Neighborhood = as.factor(Neighborhood),
+         Neighborhood2 = fct_collapse(Neighborhood,
+                                           "BluesteSawyer" = c("Blueste", "Sawyer"),
+                                           "NPkVillMitchel" = c("NPkVill", "Mitchel")))
+  
+  data_set_name <- data_set_name %>% 
+  mutate(LotShape = as.factor(LotShape),
+         LotShape2 = fct_collapse(LotShape,
+                                       "IR23" = c("IR2", "IR3")))
+
+  data_set_name <- data_set_name %>% 
+  mutate(LotConfig = as.factor(LotConfig),
+         LotConfig2 = if_else(LotConfig == "CulDSac", 1, 0)) 
+
+
+#Finding the Variables with character class
+  variable_classes <- sapply(data_set_name, class)
+  character_variables <- names(variable_classes[which(variable_classes=="character")])
+
+# Converting them to factor
+  data_set_name[character_variables] <- lapply(data_set_name[character_variables], factor)
+
+  return(data_set_name)
+}
+
+complete_data_set <- convert_to_factor_func(complete_data_set)
+```
+
+## Checking for outliers
+
+### Scatterplot to identify the outliers
+
+```{r}
+#GrLivArea
+
+ggplot(data=complete_data_set[!is.na(complete_data_set$SalePrice),], aes(x=GrLivArea, y=SalePrice))+
+        geom_point() + geom_smooth(method = "lm", se=FALSE, aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(complete_data_set$GrLivArea[!is.na(complete_data_set$SalePrice)]>4500, rownames(complete_data_set), '')))
+
+#TotalBsmtSF
+
+ggplot(data=complete_data_set[!is.na(complete_data_set$SalePrice),], aes(x=TotalBsmtSF, y=SalePrice))+
+        geom_point() + geom_smooth(method = "lm", se=FALSE, aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(complete_data_set$TotalBsmtSF[!is.na(complete_data_set$SalePrice)]>4500, rownames(complete_data_set), '')))
+
+```
+
+### Removing outliers
+
+```{r}
+
+complete_data_set <- complete_data_set[ !(complete_data_set$Id %in% c(524, 1299)), ]
+
+complete_data_set %>% 
+  filter(OverallCond == 2 & SalePrice > 12)
+
+complete_data_set <- complete_data_set %>% 
+  mutate(OverallCond = if_else(Id == 379, 5L, OverallCond))
+
+```
+> Id column is removed from both the datasets, Id is not a predictor.
+
+## Rechecking the Correlation values after cleaning the data
+
+```{r correlation}
+
+train_cleaned <- complete_data_set %>%
+                   filter(Set == "Train")
+
+test_cleaned <- complete_data_set %>%
+                   filter(Set == "Test") 
+
+#high correlation cor>0.3
+for(col in colnames(train_cleaned)){
+  if(is.numeric(train_cleaned[,col])){
+    if(abs(cor(train_cleaned[,col],train_cleaned$SalePrice)) > 0.5 ){
+      print (c(col, abs(cor(train_cleaned[,col],train_cleaned$SalePrice))))
+    }
+  }
+}
+
+
+# low correaltion cor<0.1
+for(col in colnames(train_cleaned)){
+  if(is.numeric(train_cleaned[,col])){
+    if(abs(cor(train_cleaned[,col],train_cleaned$SalePrice))<0.1){
+      print(c(col,cor(train_cleaned[,col],train_cleaned$SalePrice)))
+    }
+  }
+}
+
+```
+
+## Plots to study the important variables to be used in the model
+
+```{r histogram_plots}
+
+#OverallQual
+
+ggplot(data=complete_data_set[!is.na(complete_data_set$SalePrice),], aes(x=factor(OverallQual), y=SalePrice)) +
+ geom_boxplot(outlier.colour = "red", outlier.shape = 1)  +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) 
+
+#YearBuilt
+
+ggplot(data=complete_data_set[!is.na(complete_data_set$SalePrice),], aes(x=YearBuilt^15, y=SalePrice))+
+        geom_point() + geom_smooth(method = "lm", se=FALSE, aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(complete_data_set$YearBuilt[!is.na(complete_data_set$SalePrice)]>4500, rownames(complete_data_set), '')))
+
+ggplot(complete_data_set[!is.na(complete_data_set$SalePrice),], aes(x=Neighborhood, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+                                      
+                                          
+hist.data.frame(complete_data_set %>%
+  select("GrLivArea","RemodelAge"))
+
+hist.data.frame(complete_data_set %>%
+  select("GarageFinish","GarageCars","GarageAreaScore"))
+
+hist.data.frame(complete_data_set %>%
+  select("OverallScore","ExterScore","FireplaceScore","KitchenScore"))
+
+hist.data.frame(complete_data_set %>%
+  select("HeatingQC","CentralAir","FireplaceScore"))
+
+hist.data.frame(complete_data_set %>%
+  select("BsmtQual","TotalBsmtSF","BsmtFinSF1","TotalPorchSF","KitchenAbvGr"))
+
+hist.data.frame(complete_data_set %>%
+  select("X1stFlrSF","TotRmsAbvGrd","TotalBaths","TotalSF","OpenPorchSF"))
+
+
+
+```
+
+## Linear Regression Model
+
+```{r}
+tc <- trainControl(method = "cv", number = 5)
+
+set.seed(123)
+
+(lm_model <- train(log(SalePrice+1) ~ (factor(OverallQual)+factor(BsmtQual)*TotalBsmtSF+YearBuilt^20+log(X1stFlrSF+1)*TotRmsAbvGrd
+                                        +factor(Neighborhood)+GarageFinish^3+GarageCars*TotalBaths+RemodelAge+
+                                          TotalSF^2+OverallScore+ExterScore*MSZoning+
+                                          factor(FireplaceScore)+Fireplaces+GarageAreaScore*log(GrLivArea+1)^14+
+                                          HeatingQC^4+CentralAir^2+TotalPorchSF+BsmtFinSF1*MasVnrArea^2
+                                        +KitchenScore*KitchenAbvGr^2+OverallQual+OpenPorchSF+TotalAreaSF),
+                     data = select(train_cleaned, -Id),
+                     preProcess = c("center","scale"),
+                     trControl = tc,
+                     method = "lm"))
+summary(lm_model)
+
+
+
+```
+
+## Predictions
+
+```{r}
+
+predictions <- data.frame(Id = test_cleaned$Id,
+                          lm = exp(predict(lm_model, newdata= test_cleaned))
+                          )
+
+head(predictions)
+```
+
+
+## In-sample RMSE value
+
+```{r}
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+
+rmse(train_cleaned$SalePrice, exp(predict(lm_model, newdata= train_cleaned)) )
+```
+
+## in-sample R-squared value
+
+```{r}
+r2 <- function(actual, predicted){
+  TSS <- sum((actual - mean(actual))^2)
+  RSS <- sum((actual - predicted)^2)
+  1 - RSS/TSS
+}
+
+r2(train_cleaned$SalePrice, exp(predict(lm_model, newdata= train_cleaned)))
+```
+
+## Predicted vs actual SalePrice plot
+
+```{r}
+
+plot(exp(predict(lm_model, newdata= train_cleaned)),                                # Draw plot using Base R
+     train_cleaned$SalePrice,
+     xlab = "Predicted Values",
+     ylab = "Observed Values")
+abline(a = 0,                                        # Add straight line
+       b = 1,
+       col = "red",
+       lwd = 2)
+
+```
+
+## Submission
+
+```{r}
+#kaggle score of 0.13                         
+submit <- test_cleaned %>% 
+  select(Id) %>% 
+  mutate(SalePrice = exp(predict(object = lm_model, newdata = test_cleaned)))
+
+write.csv(submit, "kaggle_submit.csv", row.names = F )
+head(submit)
+```
+
+
